@@ -1,4 +1,3 @@
-# Full source for FGC Kivy country database application (Updated: Dynamically scale panel/text_box/image/label heights with font_scale to conserve space when font size is lowered; Preserves symmetrical row heights, text wrapping, font shrinking, and all prior functionality/optimizations)
 
 import os
 import sqlite3
@@ -486,7 +485,7 @@ class MainPanel(BoxLayout):
 
     def _apply_font_scale(self, value):
         self.font_scale = value
-        self._debounce_show_info(0)  # Immediate repaint to update font sizes and heights
+        self._debounce_show_info(0)  # Immediate repaint to update font sizes
 
     # ---------- DB helpers ----------
     def check_table_exists(self, db_file):
@@ -747,33 +746,29 @@ class MainPanel(BoxLayout):
         if 'flash_img' in self.ids:
             self.ids.flash_img.source = ''
 
-    def calculate_text_box_height(self, text_box, font_scale):
-        """Calculate the natural height of a text_box based on its child labels, respecting font_scale."""
+    def calculate_text_box_height(self, text_box):
+        """Calculate the natural height of a text_box based on its child labels."""
         for lbl in text_box.children:
             if hasattr(lbl, '_updating'):
                 lbl._updating = True
                 try:
                     lbl.text_size = (lbl.width, None)
                     lbl.texture_update()
-                    # Scale minimum height based on label type
-                    base_min_height = dp(48) if lbl.bold and lbl.text.isupper() else dp(40) if lbl.bold else dp(25)
-                    scaled_min_height = base_min_height * font_scale
-                    new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                    new_height = max(lbl.height, lbl.texture_size[1] + dp(6))
                     lbl.height = new_height
                 finally:
                     lbl._updating = False
         total_height = sum(c.height for c in text_box.children) + text_box.spacing * (len(text_box.children) - 1) + sum(text_box.padding[1::2])
-        return max(dp(180) * font_scale, total_height)
+        return max(dp(180), total_height)
 
     def _add_country_panel(self, container, country, code, continent, pron, flag_path, bg_color, is_right_column=False):
         from kivy.utils import get_color_from_hex
 
-        # Base panel with dynamic height scaled by font_scale
-        scaled_min_panel_height = dp(200) * self.font_scale
+        # Base panel with dynamic height
         panel = BoxLayout(
             orientation='horizontal',
             size_hint_y=None,
-            height=scaled_min_panel_height,  # Scaled minimum height
+            height=dp(200),  # Minimum height
             padding=[dp(8), dp(8)],
             spacing=dp(10)
         )
@@ -788,13 +783,12 @@ class MainPanel(BoxLayout):
         dark_factor = 0.45
         dark_color = (r * dark_factor, g * dark_factor, b * dark_factor, 1)
 
-        # Text box with dynamic height scaled by font_scale
-        scaled_min_text_height = dp(180) * self.font_scale
+        # Text box with dynamic height
         text_box = BoxLayout(
             orientation='vertical',
             size_hint_x=0.55,
             size_hint_y=None,
-            height=scaled_min_text_height,  # Scaled minimum height
+            height=dp(180),  # Initial minimum height
             spacing=dp(4),
             padding=[dp(4), dp(4)],
             pos_hint={'center_y': 0.5}
@@ -807,13 +801,12 @@ class MainPanel(BoxLayout):
             keep_ratio=True,
             size_hint_x=0.45,
             size_hint_y=None,
-            height=scaled_min_text_height  # Scaled minimum height
+            height=dp(180)  # Initial height, will sync with text_box
         )
 
         # Helper to create labels with fixed height for code and continent
-        def make_fixed_label(text, base_font_size, color, bold=False, base_height=dp(25)):
+        def make_fixed_label(text, base_font_size, color, bold=False, height=dp(25)):
             scaled_font_size = base_font_size * self.font_scale
-            scaled_height = base_height * self.font_scale
             lbl = Label(
                 text=text,
                 font_size=scaled_font_size,
@@ -821,21 +814,15 @@ class MainPanel(BoxLayout):
                 color=color,
                 halign='center',
                 size_hint_y=None,
-                height=scaled_height
+                height=height
             )
             lbl.bind(
                 size=lambda lbl, _: setattr(lbl, 'text_size', (lbl.width, None))
             )
-            # Bind font_scale to update height and font_size
-            self.bind(font_scale=lambda _, fs: (
-                setattr(lbl, 'font_size', base_font_size * fs),
-                setattr(lbl, 'height', base_height * fs)
-            ))
             return lbl
 
         # Helper to create labels with dynamic height and font size for name and pronunciation
-        def make_dynamic_label(text, base_font_size, color, bold=False, base_min_height=dp(25)):
-            scaled_min_height = base_min_height * self.font_scale
+        def make_dynamic_label(text, base_font_size, color, bold=False, min_height=dp(25)):
             lbl = Label(
                 text=text,
                 font_size=base_font_size * self.font_scale,
@@ -843,7 +830,7 @@ class MainPanel(BoxLayout):
                 color=color,
                 halign='center',
                 size_hint_y=None,
-                height=scaled_min_height
+                height=min_height
             )
             lbl._updating = False
             def adjust_height_and_font(*_):
@@ -858,7 +845,6 @@ class MainPanel(BoxLayout):
                     base_font_size_scaled = base_font_size * self.font_scale
                     wrapped_font_size = (sp(28) if text == country else sp(16)) * self.font_scale
                     min_font_size = sp(12) * self.font_scale
-                    scaled_min_height = base_min_height * self.font_scale
                     # Check if text has no spaces
                     no_spaces = text.find(' ') == -1
                     # Estimate single-line height
@@ -872,30 +858,27 @@ class MainPanel(BoxLayout):
                         lbl.font_size = new_font_size
                         lbl.text_size = (lbl.width, base_font_size_scaled + dp(6))  # Force single line
                         lbl.texture_update()
-                        new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                        new_height = max(min_height, lbl.texture_size[1] + dp(6))
                     else:
                         # Normal wrapping behavior
                         lbl.font_size = wrapped_font_size if is_wrapped else base_font_size_scaled
                         lbl.text_size = (lbl.width, None)
                         lbl.texture_update()
-                        new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                        new_height = max(min_height, lbl.texture_size[1] + dp(6))
                     lbl.height = new_height
                 finally:
                     lbl._updating = False
             lbl.bind(size=adjust_height_and_font, texture_size=adjust_height_and_font)
-            # Bind font_scale to update font size and height
-            self.bind(font_scale=lambda _, fs: (
-                setattr(lbl, 'font_size', base_font_size * fs),
-                adjust_height_and_font()
-            ))
+            # Bind font_scale changes
+            self.bind(font_scale=adjust_height_and_font)
             Clock.schedule_once(lambda dt: adjust_height_and_font(), 0.1)  # Initial adjustment
             return lbl
 
-        # Create labels with scaled font sizes and heights
-        code_label = make_fixed_label(code or '', sp(36), dark_color, bold=True, base_height=dp(48))
-        name_label = make_dynamic_label(country, sp(36), (0, 0, 0, 1), bold=True, base_min_height=dp(40))
-        continent_label = make_fixed_label(continent, spindle(20), (0, 0, 0, 1), base_height=dp(25))
-        pron_label = make_dynamic_label(f"Pronunciation: {pron}" if pron else '', sp(20), (0, 0, 0, 1), base_min_height=dp(25))
+        # Create labels with scaled font sizes
+        code_label = make_fixed_label(code or '', sp(36), dark_color, bold=True, height=dp(48))
+        name_label = make_dynamic_label(country, sp(36), (0, 0, 0, 1), bold=True, min_height=dp(40))
+        continent_label = make_fixed_label(continent, sp(20), (0, 0, 0, 1), height=dp(25))
+        pron_label = make_dynamic_label(f"Pronunciation: {pron}" if pron else '', sp(20), (0, 0, 0, 1), min_height=dp(25))
 
         text_box.add_widget(code_label)
         text_box.add_widget(name_label)
@@ -908,20 +891,17 @@ class MainPanel(BoxLayout):
                 return
             text_box._updating = True
             try:
-                # Use provided height or calculate natural height with scaled minimum
-                new_height = height if height is not None else self.calculate_text_box_height(text_box, self.font_scale)
+                # Use provided height or calculate natural height
+                new_height = height if height is not None else self.calculate_text_box_height(text_box)
                 text_box.height = new_height
                 img.height = new_height
-                panel.height = max(dp(200) * self.font_scale, new_height + 2 * panel.padding[1])
+                panel.height = max(dp(200), new_height + 2 * panel.padding[1])
             finally:
                 text_box._updating = False
 
         # Bind child label heights to trigger update
         for child in text_box.children:
             child.bind(height=lambda *_: update_text_box_height(text_box, img, panel))
-
-        # Bind font_scale to update heights
-        self.bind(font_scale=lambda _, fs: update_text_box_height(text_box, img, panel))
 
         # Initial height update
         Clock.schedule_once(lambda dt: update_text_box_height(text_box, img, panel), 0.2)
@@ -973,7 +953,7 @@ class MainPanel(BoxLayout):
                     right_rows = {row[0]: row[1:] for row in cur.fetchall()}
                     for country in right_countries:
                         if country in right_rows:
-                            continent, pron, flag_path, code = left_rows[country]
+                            continent, pron, flag_path, code = right_rows[country]
                             panel, text_box, img, update_fn = self._add_country_panel(right_col, country, code, continent, pron, flag_path, right_bg, True)
                             right_panels.append((panel, text_box, img, update_fn))
 
@@ -990,7 +970,7 @@ class MainPanel(BoxLayout):
                         # Calculate natural heights for each panel
                         text_heights = []
                         for _, text_box, _, _ in pair:
-                            height = self.calculate_text_box_height(text_box, self.font_scale)
+                            height = self.calculate_text_box_height(text_box)
                             text_heights.append(height)
                         # Get max height for the row
                         max_text_height = max(text_heights)
@@ -1000,7 +980,7 @@ class MainPanel(BoxLayout):
                     elif pair:
                         # Handle unpaired panel
                         _, text_box, _, update_fn = pair[0]
-                        height = self.calculate_text_box_height(text_box, self.font_scale)
+                        height = self.calculate_text_box_height(text_box)
                         update_fn(height)
 
             # Initial synchronization
