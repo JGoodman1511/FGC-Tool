@@ -1,12 +1,13 @@
-# Full source for FGC Kivy country database application (Updated: Dynamically scale panel/text_box/image/label heights with font_scale to conserve space when font size is lowered; Preserves symmetrical row heights, text wrapping, font shrinking, and all prior functionality/optimizations)
-
 import os
 import sqlite3
 import threading
 import requests
+import random
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 import time
+import math
 
 from kivy.app import App
 from kivy.lang import Builder
@@ -23,16 +24,12 @@ from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.dropdown import DropDown
 from kivy.uix.button import Button
-from kivy.uix.slider import Slider
 from kivy.metrics import dp, sp
 from kivy.properties import StringProperty, ListProperty, NumericProperty, BooleanProperty
 from kivy.utils import get_color_from_hex
 from kivy.graphics import Color, RoundedRectangle
 from kivy.core.window import Window
 from PIL import Image as PILImage
-
-# Debug flag
-DEBUG = False
 
 # ---------------------------- Country name helpers ----------------------------
 name_mapping = {
@@ -68,6 +65,7 @@ name_mapping = {
 hardcoded_countries = {
     "Congo": {"code": "COG", "continent": "Africa", "flag_filename": "Congo.png"},
     "Congo, Democratic Republic of the": {"code": "COD", "continent": "Africa", "flag_filename": "Congo, Democratic Republic of the.png"},
+    "Hope": {"code": "", "continent": "Unknown", "flag_filename": None}  # Added for invalid country; review countries.txt
 }
 
 # Theme colors used for left/right panels
@@ -282,20 +280,6 @@ KV = r'''
                             height: self.minimum_height
                             spacing: 12
 
-                    # --- Font Size Slider ---
-                    BoxLayout:
-                        orientation: 'horizontal'
-                        size_hint_y: None
-                        height: '40dp'
-                        padding: [10, 0]
-                        Slider:
-                            id: font_slider
-                            min: 0.5
-                            max: 1.0
-                            value: root.font_scale
-                            step: 0.1
-                            on_value: root.on_font_scale_change(self.value)
-
         TabbedPanelItem:
             text: 'Flashcard'
             BoxLayout:
@@ -327,15 +311,13 @@ KV = r'''
 
         TabbedPanelItem:
             text: 'Reference'
-            BoxLayout:
-                orientation: 'vertical'
-                padding: 0
-                spacing: 0
+            FloatLayout:
                 Label:
                     id: ref_missing
                     text: ''
-                    size_hint_y: None
-                    height: self.texture_size[1] if self.text else '0dp'
+                    size_hint: None, None
+                    size: self.texture_size
+                    pos_hint: {'center_x': 0.5, 'top': 1}
                     color: 1, 0, 0, 1
                 Image:
                     id: ref_img
@@ -343,6 +325,7 @@ KV = r'''
                     allow_stretch: True
                     keep_ratio: True
                     pos_hint: {'center_x': 0.5, 'center_y': 0.5}
+
 '''
 
 # ---------------------------- TableRow viewclass ----------------------------
@@ -441,9 +424,7 @@ class MainPanel(BoxLayout):
     progress_value = NumericProperty(0)
     progress_max = NumericProperty(1)
     swap_colors = BooleanProperty(False)
-    font_scale = NumericProperty(1.0)  # Font size scaling
     _show_info_debounce = None
-    _font_scale_debounce = None
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -478,16 +459,6 @@ class MainPanel(BoxLayout):
             self.refresh_table()
             self.update_dropdowns()
 
-    def on_font_scale_change(self, value):
-        """Debounced handler for font scale changes."""
-        if self._font_scale_debounce:
-            self._font_scale_debounce.cancel()
-        self._font_scale_debounce = Clock.schedule_once(lambda dt: self._apply_font_scale(value), 0.2)
-
-    def _apply_font_scale(self, value):
-        self.font_scale = value
-        self._debounce_show_info(0)  # Immediate repaint to update font sizes and heights
-
     # ---------- DB helpers ----------
     def check_table_exists(self, db_file):
         try:
@@ -497,16 +468,16 @@ class MainPanel(BoxLayout):
                 cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='countries'")
                 return cur.fetchone() is not None
         except Exception as e:
-            if DEBUG: print(f"check_table_exists error: {e}")
+            print(f"check_table_exists error: {e}")
             return False
 
     def on_rebuild_db(self):
-        if DEBUG: print("Starting database rebuild...")
+        print("Starting database rebuild...")
         threading.Thread(target=self.build_database, args=(self.txt_file,), daemon=True).start()
 
     def _fetch_country_data(self, country, max_retries=3):
         """Fetch API data with retries."""
-        if DEBUG: print(f"Fetching data for {country}...")
+        print(f"Fetching data for {country}...")
         query_name = name_mapping.get(country, country)
         safe_name = country.replace('/', '_').replace('\\', '_')
         expected_path = os.path.join('flags', f"{safe_name}.png")
@@ -514,9 +485,15 @@ class MainPanel(BoxLayout):
         for attempt in range(max_retries):
             try:
                 resp = requests.get(f"https://restcountries.com/v3.1/name/{query_name}?fullText=true", timeout=5)
-                if DEBUG: print(f"API response for {country}: status={resp.status_code}")
+                print(f"API response for {country}: status={resp.status_code}")
                 if resp.status_code == 200 and resp.json():
-                    data = resp.json()[0]  # Simplified: fullText=true ensures exact match
+                    candidates = resp.json()
+                    data = None
+                    for c in candidates:
+                        if c.get('name', {}).get('official', '').lower() == country.lower():
+                            data = c; break
+                    if not data:
+                        data = candidates[0]
                     # Download flag if not exists
                     if not os.path.exists(expected_path):
                         png_url = data.get('flags', {}).get('png')
@@ -526,33 +503,33 @@ class MainPanel(BoxLayout):
                                 img = PILImage.open(BytesIO(r.content)).convert('RGBA')
                                 img = img.resize((600, 360), PILImage.LANCZOS)
                                 img.save(expected_path, format='PNG')
-                                if DEBUG: print(f"Saved flag for {country} at {expected_path}")
+                                print(f"Saved flag for {country} at {expected_path}")
                             else:
-                                if DEBUG: print(f"Flag download failed for {country}: Status {r.status_code}")
+                                print(f"Flag download failed for {country}: Status {r.status_code}")
                                 return None, None
                         else:
-                            if DEBUG: print(f"No flag URL for {country}")
+                            print(f"No flag URL for {country}")
                             return None, None
                     # Extract continent and code
                     continent = data.get('continents', [None])[0] or 'Unknown'
                     code = data.get('cca3', '') or ''
-                    if DEBUG: print(f"Extracted for {country}: continent={continent}, code={code}")
+                    print(f"Extracted for {country}: continent={continent}, code={code}")
                     return data, expected_path
                 else:
-                    if DEBUG: print(f"API call failed for {country}: Status {resp.status_code}, Response: {resp.text[:100]}...")
+                    print(f"API call failed for {country}: Status {resp.status_code}, Response: {resp.text[:100]}...")
                     return None, None
             except Exception as e:
                 if attempt == max_retries - 1:
-                    if DEBUG: print(f"API error for {country} after {max_retries} attempts: {e}")
+                    print(f"API error for {country} after {max_retries} attempts: {e}")
                     return None, None
                 time.sleep(2 ** attempt)  # Exponential backoff
 
     def build_database(self, file_path):
         try:
-            if DEBUG: print(f"Reading countries from {file_path}...")
+            print(f"Reading countries from {file_path}...")
             if not os.path.exists(file_path):
                 Clock.schedule_once(lambda dt: self._set_status(f"Error: {file_path} not found"), 0)
-                if DEBUG: print(f"Error: {file_path} not found")
+                print(f"Error: {file_path} not found")
                 return
             with open(file_path, 'r', encoding='utf-8') as f:
                 countries = []
@@ -566,13 +543,13 @@ class MainPanel(BoxLayout):
                             countries.append((country, pron))
                             seen.add(country)
                         else:
-                            if DEBUG: print(f"Skipping duplicate country: {country}")
+                            print(f"Skipping duplicate country: {country}")
                 countries = sorted(countries, key=lambda x: x[0])
             if not countries:
                 Clock.schedule_once(lambda dt: self._set_status('Error: No countries found!'), 0)
-                if DEBUG: print("Error: No countries found in countries.txt")
+                print("Error: No countries found in countries.txt")
                 return
-            if DEBUG: print(f"Found {len(countries)} unique countries in {file_path}")
+            print(f"Found {len(countries)} unique countries in {file_path}")
 
             os.makedirs('flags', exist_ok=True)
             total = len(countries)
@@ -582,7 +559,7 @@ class MainPanel(BoxLayout):
             hardcoded_data = []
             api_countries = []
             skipped_countries = []
-            if DEBUG: print("Processing hardcoded countries...")
+            print("Processing hardcoded countries...")
             for i, (country, pron) in enumerate(countries):
                 if country in hardcoded_countries:
                     info = hardcoded_countries[country]
@@ -591,14 +568,14 @@ class MainPanel(BoxLayout):
                     expected_path = os.path.join('flags', flag_filename) if flag_filename else None
                     flag_path = expected_path if expected_path and os.path.exists(expected_path) else None
                     hardcoded_data.append((country, continent, pron, flag_path, code))
-                    if DEBUG: print(f"Added hardcoded country: {country}")
+                    print(f"Added hardcoded country: {country}")
                 else:
                     api_countries.append((country, pron, i))  # Track original index
 
             # Parallel API fetches
-            if DEBUG: print(f"Starting API fetches for {len(api_countries)} countries...")
-            api_data = {c: None for c, _, _ in api_countries}
-            with ThreadPoolExecutor(max_workers=5) as executor:  # Reduced to 5 to avoid rate limiting
+            print(f"Starting API fetches for {len(api_countries)} countries...")
+            api_data = {c: None for c, _ , _ in api_countries}
+            with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(self._fetch_country_data, c): (c, p) for c, p, _ in api_countries}
                 completed = 0
                 for future in as_completed(futures):
@@ -606,23 +583,23 @@ class MainPanel(BoxLayout):
                     try:
                         data, flag_path = future.result()
                         if data is None or flag_path is None:
-                            if DEBUG: print(f"Skipping {country}: No valid data or flag available")
+                            print(f"Skipping {country}: No valid data or flag available")
                             skipped_countries.append(country)
                             continue
                         continent = data.get('continents', [None])[0]
                         if continent is None:
-                            if DEBUG: print(f"Skipping {country}: No continent data")
+                            print(f"Skipping {country}: No continent data")
                             skipped_countries.append(country)
                             continue
                         code = data.get('cca3', '')
                         if not code:
-                            if DEBUG: print(f"Skipping {country}: No CCA3 code")
+                            print(f"Skipping {country}: No CCA3 code")
                             skipped_countries.append(country)
                             continue
                         api_data[country] = (continent, pron, flag_path, code)
-                        if DEBUG: print(f"Processed {country}: continent={continent}, code={code}")
+                        print(f"Processed {country}: continent={continent}, code={code}")
                     except Exception as e:
-                        if DEBUG: print(f"Future error for {country}: {e}")
+                        print(f"Future error for {country}: {e}")
                         skipped_countries.append(country)
                         api_data[country] = None
                     completed += 1
@@ -633,13 +610,13 @@ class MainPanel(BoxLayout):
             all_data = hardcoded_data + [
                 (c, *api_data[c]) for c in [cc[0] for cc in api_countries] if api_data[c] is not None
             ]
-            if DEBUG: print(f"Prepared {len(all_data)} valid entries for database insertion")
+            print(f"Prepared {len(all_data)} valid entries for database insertion")
             if not all_data:
                 Clock.schedule_once(lambda dt: self._set_status("Error: No valid country data to insert"), 0)
-                if DEBUG: print("Error: No valid country data to insert")
+                print("Error: No valid country data to insert")
                 return
 
-            if DEBUG: print("Writing to database...")
+            print("Writing to database...")
             try:
                 with sqlite3.connect(self.db_file) as conn:
                     conn.execute('PRAGMA journal_mode=WAL')
@@ -655,40 +632,40 @@ class MainPanel(BoxLayout):
                     # Verify insertion
                     cur.execute('SELECT COUNT(*) FROM countries')
                     row_count = cur.fetchone()[0]
-                    if DEBUG: print(f"Inserted {row_count} rows into database")
+                    print(f"Inserted {row_count} rows into database")
                     if row_count != len(all_data):
-                        if DEBUG: print(f"Warning: Expected {len(all_data)} rows, but inserted {row_count}")
+                        print(f"Warning: Expected {len(all_data)} rows, but inserted {row_count}")
             except sqlite3.Error as e:
                 Clock.schedule_once(lambda dt: self._set_status(f"Database error: {e}"), 0)
-                if DEBUG: print(f"Database insertion error: {e}")
+                print(f"Database insertion error: {e}")
                 return
 
             skip_msg = f" Skipped {len(skipped_countries)} invalid countries: {', '.join(skipped_countries)}" if skipped_countries else ""
             Clock.schedule_once(lambda dt: self._set_status(f"Database build complete! {row_count} countries.{skip_msg}"), 0)
             Clock.schedule_once(lambda dt: (self.update_dropdowns() or self.refresh_table()), 1.0)
-            if DEBUG: print(f"Database build complete: {row_count} countries inserted. {skip_msg}")
+            print(f"Database build complete: {row_count} countries inserted. {skip_msg}")
         except Exception as e:
             Clock.schedule_once(lambda dt: self._set_status(f"Error: {e}"), 0)
-            if DEBUG: print(f"Build error: {e}")
+            print(f"Build error: {e}")
 
     # ---------- UI property helpers ----------
     def _set_status(self, text):
         self.status_text = text
-        if DEBUG: print(f"Status updated: {text}")
+        print(f"Status updated: {text}")
 
     def _set_progress(self, value):
         self.progress_value = value
-        if DEBUG: print(f"Progress updated: {value}/{self.progress_max}")
+        print(f"Progress updated: {value}/{self.progress_max}")
 
     def _set_progress_max(self, v):
         self.progress_max = max(1, v)
         self.progress_value = 0
-        if DEBUG: print(f"Progress max set to: {v}")
+        print(f"Progress max set to: {v}")
 
     # ---------- Table & dropdowns ----------
     def refresh_table(self):
         try:
-            if DEBUG: print("Refreshing table...")
+            print("Refreshing table...")
             with sqlite3.connect(self.db_file) as conn:
                 cur = conn.cursor()
                 cur.execute('SELECT name, continent, pronunciation, flag_path, code FROM countries ORDER BY name')
@@ -698,15 +675,15 @@ class MainPanel(BoxLayout):
                 for n, c, p, fp, cd in rows
             ]
             self.ids.rv_table.data = data
-            if DEBUG: print(f"Table refreshed with {len(data)} rows")
+            print(f"Table refreshed with {len(data)} rows")
             self._set_progress(0)
         except Exception as e:
             self._set_status(f"DB error: {e}")
-            if DEBUG: print(f"refresh_table error: {e}")
+            print(f"refresh_table error: {e}")
 
     def update_dropdowns(self):
         try:
-            if DEBUG: print("Updating dropdowns...")
+            print("Updating dropdowns...")
             with sqlite3.connect(self.db_file) as conn:
                 cur = conn.cursor()
                 cur.execute('SELECT name FROM countries ORDER BY name')
@@ -714,10 +691,9 @@ class MainPanel(BoxLayout):
             for w in list(self.ids.left_spinners.children) + list(self.ids.right_spinners.children):
                 if isinstance(w, ComboBox):
                     w.set_options(countries)
-            if DEBUG: print(f"Dropdowns updated with {len(countries)} countries")
+            print(f"Dropdowns updated with {len(countries)} countries")
         except Exception as e:
-            self._set_status(f"Error: {e}")
-            if DEBUG: print(f"update_dropdowns error: {e}")
+            print(f"update_dropdowns error: {e}")
 
     def _debounce_show_info(self, delay=0.1):
         if self._show_info_debounce:
@@ -747,33 +723,29 @@ class MainPanel(BoxLayout):
         if 'flash_img' in self.ids:
             self.ids.flash_img.source = ''
 
-    def calculate_text_box_height(self, text_box, font_scale):
-        """Calculate the natural height of a text_box based on its child labels, respecting font_scale."""
+    def calculate_text_box_height(self, text_box):
+        """Calculate the natural height of a text_box based on its child labels."""
         for lbl in text_box.children:
             if hasattr(lbl, '_updating'):
                 lbl._updating = True
                 try:
                     lbl.text_size = (lbl.width, None)
                     lbl.texture_update()
-                    # Scale minimum height based on label type
-                    base_min_height = dp(48) if lbl.bold and lbl.text.isupper() else dp(40) if lbl.bold else dp(25)
-                    scaled_min_height = base_min_height * font_scale
-                    new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                    new_height = max(lbl.height, lbl.texture_size[1] + dp(6))
                     lbl.height = new_height
                 finally:
                     lbl._updating = False
         total_height = sum(c.height for c in text_box.children) + text_box.spacing * (len(text_box.children) - 1) + sum(text_box.padding[1::2])
-        return max(dp(180) * font_scale, total_height)
+        return max(dp(180), total_height)
 
     def _add_country_panel(self, container, country, code, continent, pron, flag_path, bg_color, is_right_column=False):
         from kivy.utils import get_color_from_hex
 
-        # Base panel with dynamic height scaled by font_scale
-        scaled_min_panel_height = dp(200) * self.font_scale
+        # Base panel with dynamic height
         panel = BoxLayout(
             orientation='horizontal',
             size_hint_y=None,
-            height=scaled_min_panel_height,  # Scaled minimum height
+            height=dp(200),  # Minimum height
             padding=[dp(8), dp(8)],
             spacing=dp(10)
         )
@@ -788,13 +760,12 @@ class MainPanel(BoxLayout):
         dark_factor = 0.45
         dark_color = (r * dark_factor, g * dark_factor, b * dark_factor, 1)
 
-        # Text box with dynamic height scaled by font_scale
-        scaled_min_text_height = dp(180) * self.font_scale
+        # Text box with dynamic height
         text_box = BoxLayout(
             orientation='vertical',
             size_hint_x=0.55,
             size_hint_y=None,
-            height=scaled_min_text_height,  # Scaled minimum height
+            height=dp(180),  # Initial minimum height
             spacing=dp(4),
             padding=[dp(4), dp(4)],
             pos_hint={'center_y': 0.5}
@@ -807,43 +778,35 @@ class MainPanel(BoxLayout):
             keep_ratio=True,
             size_hint_x=0.45,
             size_hint_y=None,
-            height=scaled_min_text_height  # Scaled minimum height
+            height=dp(180)  # Initial height, will sync with text_box
         )
 
         # Helper to create labels with fixed height for code and continent
-        def make_fixed_label(text, base_font_size, color, bold=False, base_height=dp(25)):
-            scaled_font_size = base_font_size * self.font_scale
-            scaled_height = base_height * self.font_scale
+        def make_fixed_label(text, font_size, color, bold=False, height=dp(25)):
             lbl = Label(
                 text=text,
-                font_size=scaled_font_size,
+                font_size=font_size,
                 bold=bold,
                 color=color,
                 halign='center',
                 size_hint_y=None,
-                height=scaled_height
+                height=height
             )
             lbl.bind(
                 size=lambda lbl, _: setattr(lbl, 'text_size', (lbl.width, None))
             )
-            # Bind font_scale to update height and font_size
-            self.bind(font_scale=lambda _, fs: (
-                setattr(lbl, 'font_size', base_font_size * fs),
-                setattr(lbl, 'height', base_height * fs)
-            ))
             return lbl
 
         # Helper to create labels with dynamic height and font size for name and pronunciation
-        def make_dynamic_label(text, base_font_size, color, bold=False, base_min_height=dp(25)):
-            scaled_min_height = base_min_height * self.font_scale
+        def make_dynamic_label(text, font_size, color, bold=False, min_height=dp(25)):
             lbl = Label(
                 text=text,
-                font_size=base_font_size * self.font_scale,
+                font_size=font_size,
                 bold=bold,
                 color=color,
                 halign='center',
                 size_hint_y=None,
-                height=scaled_min_height
+                height=min_height
             )
             lbl._updating = False
             def adjust_height_and_font(*_):
@@ -854,48 +817,41 @@ class MainPanel(BoxLayout):
                     # Set text_size to allow wrapping
                     lbl.text_size = (lbl.width, None)
                     lbl.texture_update()
-                    # Base font size based on label type, scaled by font_scale
-                    base_font_size_scaled = base_font_size * self.font_scale
-                    wrapped_font_size = (sp(28) if text == country else sp(16)) * self.font_scale
-                    min_font_size = sp(12) * self.font_scale
-                    scaled_min_height = base_min_height * self.font_scale
+                    # Base font size based on label type
+                    base_font_size = sp(36) if text == country else sp(20)
+                    wrapped_font_size = sp(28) if text == country else sp(16)
                     # Check if text has no spaces
                     no_spaces = text.find(' ') == -1
                     # Estimate single-line height
-                    single_line_height = base_font_size_scaled + dp(6)
+                    single_line_height = base_font_size + dp(6)
                     # Check if text would wrap
                     is_wrapped = lbl.texture_size[1] > single_line_height
                     if no_spaces and lbl.texture_size[0] > lbl.text_size[0]:
                         # Shrink font to fit width, no wrapping
                         scale = lbl.text_size[0] / lbl.texture_size[0]
-                        new_font_size = max(min_font_size, base_font_size_scaled * scale)
+                        new_font_size = max(sp(12), base_font_size * scale)
                         lbl.font_size = new_font_size
-                        lbl.text_size = (lbl.width, base_font_size_scaled + dp(6))  # Force single line
+                        lbl.text_size = (lbl.width, base_font_size + dp(6))  # Force single line
                         lbl.texture_update()
-                        new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                        new_height = max(min_height, lbl.texture_size[1] + dp(6))
                     else:
                         # Normal wrapping behavior
-                        lbl.font_size = wrapped_font_size if is_wrapped else base_font_size_scaled
+                        lbl.font_size = wrapped_font_size if is_wrapped else base_font_size
                         lbl.text_size = (lbl.width, None)
                         lbl.texture_update()
-                        new_height = max(scaled_min_height, lbl.texture_size[1] + dp(6))
+                        new_height = max(min_height, lbl.texture_size[1] + dp(6))
                     lbl.height = new_height
                 finally:
                     lbl._updating = False
             lbl.bind(size=adjust_height_and_font, texture_size=adjust_height_and_font)
-            # Bind font_scale to update font size and height
-            self.bind(font_scale=lambda _, fs: (
-                setattr(lbl, 'font_size', base_font_size * fs),
-                adjust_height_and_font()
-            ))
             Clock.schedule_once(lambda dt: adjust_height_and_font(), 0.1)  # Initial adjustment
             return lbl
 
-        # Create labels with scaled font sizes and heights
-        code_label = make_fixed_label(code or '', sp(36), dark_color, bold=True, base_height=dp(48))
-        name_label = make_dynamic_label(country, sp(36), (0, 0, 0, 1), bold=True, base_min_height=dp(40))
-        continent_label = make_fixed_label(continent, spindle(20), (0, 0, 0, 1), base_height=dp(25))
-        pron_label = make_dynamic_label(f"Pronunciation: {pron}" if pron else '', sp(20), (0, 0, 0, 1), base_min_height=dp(25))
+        # Create labels
+        code_label = make_fixed_label(code or '', '36sp', dark_color, bold=True, height=dp(48))
+        name_label = make_dynamic_label(country, '48sp', (0, 0, 0, 1), bold=True, min_height=dp(40))
+        continent_label = make_fixed_label(continent, '20sp', (0, 0, 0, 1), height=dp(25))
+        pron_label = make_dynamic_label(f"Pronunciation: {pron}" if pron else '', '20sp', (0, 0, 0, 1), min_height=dp(25))
 
         text_box.add_widget(code_label)
         text_box.add_widget(name_label)
@@ -908,20 +864,17 @@ class MainPanel(BoxLayout):
                 return
             text_box._updating = True
             try:
-                # Use provided height or calculate natural height with scaled minimum
-                new_height = height if height is not None else self.calculate_text_box_height(text_box, self.font_scale)
+                # Use provided height or calculate natural height
+                new_height = height if height is not None else self.calculate_text_box_height(text_box)
                 text_box.height = new_height
                 img.height = new_height
-                panel.height = max(dp(200) * self.font_scale, new_height + 2 * panel.padding[1])
+                panel.height = max(dp(200), new_height + 2 * panel.padding[1])
             finally:
                 text_box._updating = False
 
         # Bind child label heights to trigger update
         for child in text_box.children:
             child.bind(height=lambda *_: update_text_box_height(text_box, img, panel))
-
-        # Bind font_scale to update heights
-        self.bind(font_scale=lambda _, fs: update_text_box_height(text_box, img, panel))
 
         # Initial height update
         Clock.schedule_once(lambda dt: update_text_box_height(text_box, img, panel), 0.2)
@@ -934,7 +887,7 @@ class MainPanel(BoxLayout):
             panel.add_widget(img)
             panel.add_widget(text_box)
         container.add_widget(panel)
-        return panel, text_box, img, lambda height=None: update_text_box_height(text_box, img, panel, height)
+        return panel, text_box, img, partial(update_text_box_height, text_box, img, panel)
 
     def show_info(self):
         left_col = self.ids.left_column
@@ -973,7 +926,7 @@ class MainPanel(BoxLayout):
                     right_rows = {row[0]: row[1:] for row in cur.fetchall()}
                     for country in right_countries:
                         if country in right_rows:
-                            continent, pron, flag_path, code = left_rows[country]
+                            continent, pron, flag_path, code = right_rows[country]
                             panel, text_box, img, update_fn = self._add_country_panel(right_col, country, code, continent, pron, flag_path, right_bg, True)
                             right_panels.append((panel, text_box, img, update_fn))
 
@@ -990,7 +943,7 @@ class MainPanel(BoxLayout):
                         # Calculate natural heights for each panel
                         text_heights = []
                         for _, text_box, _, _ in pair:
-                            height = self.calculate_text_box_height(text_box, self.font_scale)
+                            height = self.calculate_text_box_height(text_box)
                             text_heights.append(height)
                         # Get max height for the row
                         max_text_height = max(text_heights)
@@ -1000,25 +953,23 @@ class MainPanel(BoxLayout):
                     elif pair:
                         # Handle unpaired panel
                         _, text_box, _, update_fn = pair[0]
-                        height = self.calculate_text_box_height(text_box, self.font_scale)
+                        height = self.calculate_text_box_height(text_box)
                         update_fn(height)
 
             # Initial synchronization
             Clock.schedule_once(synchronize_heights, 0.7)
 
-            # Bind to window size, label heights, and font_scale for dynamic updates
+            # Bind to window size and label heights for dynamic updates
             def on_resize_or_label_change(*_):
                 Clock.schedule_once(synchronize_heights, 0.2)
 
             Window.bind(on_resize=on_resize_or_label_change)
-            self.bind(font_scale=on_resize_or_label_change)
             for _, text_box, _, _ in left_panels + right_panels:
                 for child in text_box.children:
                     child.bind(height=on_resize_or_label_change)
 
         except Exception as e:
-            self._set_status(f"Error: {e}")
-            if DEBUG: print(f"show_info error: {e}")
+            print('show_info error:', e)
 
     # ---------- Flashcard ----------
     def on_flash_random(self):
@@ -1035,15 +986,14 @@ class MainPanel(BoxLayout):
                 else:
                     self.ids.flash_img.source = ''
                     self.ids.flash_info.clear_widgets()
-                    self.ids.flash_info.add_widget(Label(text='Flag image missing', font_size=sp(20) * self.font_scale, color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
+                    self.ids.flash_info.add_widget(Label(text='Flag image missing', font_size='20sp', color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
             else:
                 self.ids.flash_info.clear_widgets()
-                self.ids.flash_info.add_widget(Label(text='No data', font_size=sp(20) * self.font_scale, color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
+                self.ids.flash_info.add_widget(Label(text='No data', font_size='20sp', color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
         except Exception as e:
-            self._set_status(f"Error: {e}")
-            if DEBUG: print(f"flash random error: {e}")
+            print('flash random error:', e)
             self.ids.flash_info.clear_widgets()
-            self.ids.flash_info.add_widget(Label(text=f'Error: {e}', font_size=sp(20) * self.font_scale, color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
+            self.ids.flash_info.add_widget(Label(text=f'Error: {e}', font_size='20sp', color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
 
     def on_flash_reveal(self):
         try:
@@ -1058,10 +1008,10 @@ class MainPanel(BoxLayout):
                 self.ids.flash_info.clear_widgets()
 
                 # Helper to create labels matching dashboard styling with white text
-                def make_label(text, base_font_size, bold=False):
+                def make_label(text, font_size, bold=False):
                     lbl = Label(
                         text=text,
-                        font_size=base_font_size * self.font_scale,
+                        font_size=font_size,
                         bold=bold,
                         color=(1, 1, 1, 1),
                         halign='center',
@@ -1072,15 +1022,13 @@ class MainPanel(BoxLayout):
                         size=lambda lbl, _: setattr(lbl, 'text_size', (lbl.width, None)),
                         texture_size=lambda lbl, ts: setattr(lbl, 'height', ts[1] + dp(6))
                     )
-                    # Bind font_scale changes
-                    self.bind(font_scale=lambda _, __: setattr(lbl, 'font_size', base_font_size * self.font_scale))
                     return lbl
 
                 # Create labels with dashboard styling
-                code_label = make_label(code, sp(36), bold=True)
-                name_label = make_label(self._current_country, sp(30), bold=True)
+                code_label = make_label(code, '36sp', bold=True)
+                name_label = make_label(self._current_country, '30sp', bold=True)
                 info_text = f"{continent}\nPronunciation: {pron}" if pron else continent
-                info_label = make_label(info_text, sp(20))
+                info_label = make_label(info_text, '20sp')
 
                 # Add labels to flash_info
                 self.ids.flash_info.add_widget(code_label)
@@ -1088,19 +1036,17 @@ class MainPanel(BoxLayout):
                 self.ids.flash_info.add_widget(info_label)
             else:
                 self.ids.flash_info.clear_widgets()
-                self.ids.flash_info.add_widget(Label(text='No data', font_size=sp(20) * self.font_scale, color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
+                self.ids.flash_info.add_widget(Label(text='No data', font_size='20sp', color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
         except Exception as e:
-            self._set_status(f"Error: {e}")
-            if DEBUG: print(f"flash reveal error: {e}")
             self.ids.flash_info.clear_widgets()
-            self.ids.flash_info.add_widget(Label(text=f'Error: {e}', font_size=sp(20) * self.font_scale, color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
+            self.ids.flash_info.add_widget(Label(text=f'Error: {e}', font_size='20sp', color=(1, 1, 1, 1), halign='center', valign='middle', size_hint_y=None, height=dp(30)))
 
 # ---------------------------- App ----------------------------
 class FGCApp(App):
     def build(self):
         self.title = 'FGC GA Tool'
         self.icon = 'fgc.ico'
-        Window.size = (1000, 700)
+        #Window.size = (1000, 700)
         Builder.load_string(KV)
         return MainPanel()
 
